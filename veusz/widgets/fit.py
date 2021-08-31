@@ -52,13 +52,42 @@ def _(text, disambiguation=None, context='Fit'):
     """Translate text."""
     return qt.QCoreApplication.translate(context, text, disambiguation)
 
-def minuitFit(evalfunc, params, names, values, xvals, yvals, yserr):
+#SUGGESTION - simple function to parse a dict of PARAMETER[low_limit,high_limit]:VALUE to PARAMETER:(low_limit,high_limit) and PARAMETER:VALUE dicts
+def valsExtractNamesLimits(vals):
+    retvals = {}
+    retlimits = {}
+    paramvals = dict(vals)
+    for key in paramvals:
+        #remove extraneous spaces from key name
+        key=key.replace(" ","")
+        #match key with PARAMETER[low_limit,high_limit], limits can include 'inf', 'nan', etc
+        km=re.match('(\w+)\[([\d\.\-infeEna\+]+),([\d\.\-infeEna\+]+)\]',key) 
+        #record low and high limits
+        if km != None:
+            retvals[km[1]]=paramvals[key]
+            try:
+              retlimits[km[1]]=(float(km[2]),float(km[3]))
+            except ValueError:
+              retlimits[km[1]]=(-N.inf,N.inf)
+        else:
+            #no limits defined, therefore implicitly -inf,inf
+            retvals[key]=paramvals[key]
+            retlimits[key]=(-N.inf,N.inf)
+    return retvals,retlimits
+
+#SUGGESTION - accepting dict of initial parameter values where parameter names also contain [low_limit,high_limit] definitions
+def minuitFit(evalfunc, params, names, inivalues, xvals, yvals, yserr):
     """Do fitting with minuit (if installed)."""
 
     def chi2(params):
         """generate a lambda function to impedance-match between PyMinuit's
         use of multiple parameters versus our use of a single numpy vector."""
-        c = ((evalfunc(params, xvals) - yvals)**2 / yserr**2).sum()
+        ef = evalfunc(params, xvals) #SUGGESTION
+        #c = ((evalfunc(params, xvals) - yvals)**2/yserr**2 ).sum()   ##JAI ##SUGGESTIOn removed /yserr**2 -- introduced signifciant artefact, prob /1e-8**2=/1e-16**2  must be addressed!!
+        if chi2.iters < 1 or yserr is None:
+            c = ((ef - yvals)**2 ).sum() #SUGGESTION - first iteration no weighting, as per GraphPad Prism 5+
+        else:
+            c = ((ef - yvals)**2/ef**2 ).sum() #SUGGESTION - subsequent iterations weighted as Ycurve**2 as per GraphPad Prism 5+
         if chi2.runningFit:
             chi2.iters += 1
             p = [chi2.iters, c] + params.tolist()
@@ -67,17 +96,36 @@ def minuitFit(evalfunc, params, names, values, xvals, yvals, yserr):
 
         return c
 
+    #SUGGESTION - hack so this comparison does not need to be made during iteration
+    if yserr.sum()==0.:
+        yserr = None
+
     namestr = ', '.join(names)
     fnstr = 'lambda %s: chi2(N.array([%s]))' % (namestr, namestr)
 
     # this is safe because the only user-controlled variable is len(names)
     fn = eval(fnstr, {'chi2' : chi2, 'N' : N})
 
+    #SUGGESTION - extract limits from parameter definitions, if present
+    values,limits=valsExtractNamesLimits(inivalues)
+
     print(_('Fitting via Minuit:'))
     m = minuit.Minuit(fn, **values)
 
     # set errordef explicitly (least-squares: 1.0 or log-likelihood: 0.5) 
     m.errordef = 1.0
+    
+    #SUGGESTION - set lower convergence tolerance, default 0.1
+    m.tol = 1e-3
+    
+    #SUGGESTION - careful strategy
+    m.strategy = 2
+
+    #SUGGESTION - if limits defined, pass them to the minuit object
+    if limits != None:
+        for key in limits:
+            m.limits[key]=limits[key]
+            print(_("Parameter %s defined with limits [%g:%g]\n" % (key,*limits[key])))
 
     # run the fit
     chi2.runningFit = True
@@ -102,7 +150,7 @@ def minuitFit(evalfunc, params, names, values, xvals, yvals, yserr):
     retchi2 = m.fval
     dof = len(yvals) - len(params)
     redchi2 = retchi2 / dof
-
+    
     if have_err:
         if isiminuit1:
             results = ["    %s = %g \u00b1 %g (+%g / %g)" % (
@@ -125,8 +173,30 @@ def minuitFit(evalfunc, params, names, values, xvals, yvals, yserr):
 
     print("chi^2 = %g, dof = %i, reduced-chi^2 = %g" % (retchi2, dof, redchi2))
 
-    vals = {name:m.values[name] for name in names}
-    return vals, retchi2, dof
+    #SUGGESTION - reconstruct output parameter names with [low_limit,high_limit] limit definitions
+    if limits != None:
+      vals = {("%s[%g,%g]" % (name,*limits[name]) if name in limits else name):m.values[name] for name in names}
+    else:
+      vals = {name:m.values[name] for name in names}
+
+    #SUGGESTION - calculate standard errors
+    if have_err or have_symerr:
+      chi2.runningFit = False
+      cov=N.array(m.covariance)
+      try:
+        diag=N.diag(cov)
+        diagSS=diag*chi2(params)/dof
+        SE=N.sqrt(diagSS)
+        print('Standard errors')
+        print(SE)
+        errs={names[idx]:float(SE[idx]) for idx in range(names.__len__())}
+      except ValueError:
+        errs={name:-1. for name in names}
+    else:
+      errs={name:-1. for name in names}
+    ##
+    
+    return vals, retchi2, dof, errs
 
 class Fit(FunctionPlotter):
     """A plotter to fit a function to data."""
@@ -192,6 +262,18 @@ class Fit(FunctionPlotter):
             descr=_('Output reduced-chi-squared from fitting'),
             usertext=_('Fit reduced &chi;<sup>2</sup>')),
             9, readonly=True )
+        #SUGGESTION - saveable representation of errors of fitting parameters
+        s.add( setting.FloatDict(
+            'errors',
+            {'a': 0.0, 'b': 1.0},
+            descr=_('Errors of fits'),
+            usertext=_('Errors')), 10 )
+        #SUGGESTION - choice of weighting
+        s.add( setting.Bool(
+            'weightYsquared', False,
+            descr=_(
+                'Weight data points by 1/Y<sup>2</sup>'),
+            usertext=_('Weight 1/Y<sup>2</sup>')), 11 )
 
         f = s.get('function')
         f.newDefault('a + b*x')
@@ -219,14 +301,17 @@ class Fit(FunctionPlotter):
     def initEnviron(self):
         """Copy data into environment."""
         env = self.document.evaluate.context.copy()
-        env.update( self.settings.values )
+        #SUGGESTION - if the PARAMETER[low_limit,high_limit] syntax is used these must be stripped for the parameters to be properly matched to the function
+        values,limits=valsExtractNamesLimits(self.settings.values)
+        env.update( values )
         return env
 
     def updateOutputLabel(self, ops, vals, chi2, dof):
         """Use best fit parameters to update text label."""
         s = self.settings
         labelwidget = s.get('outLabel').findWidget()
-
+        #SUGGESTION - if the PARAMETER[low_limit,high_limit] syntax is used these must be stripped
+        vals,limits=valsExtractNamesLimits(vals)
         if labelwidget is not None:
             # build up a set of X=Y values
             loc = self.document.locale
@@ -255,9 +340,10 @@ class Fit(FunctionPlotter):
         if compiled is None:
             return
 
-        # populate the input parameters
-        paramnames = sorted(s.values)
-        params = N.array( [s.values[p] for p in paramnames] )
+        #SUGGESTION - extract the parameter names from PARAMETER[low_limit,high_limit] syntax
+        paramvalues,limits=valsExtractNamesLimits(s.values)
+        paramnames = sorted(paramvalues)
+        params = N.array( [paramvalues[p] for p in paramnames] )
 
         # FIXME: loads of error handling!!
         d = self.document
@@ -274,14 +360,34 @@ class Fit(FunctionPlotter):
         yserr = ydata.serr
 
         # if there are no errors on data
-        if yserr is None:
-            if ydata.perr is not None and ydata.nerr is not None:
-                print("Warning: Symmeterising positive and negative errors")
-                yserr = N.sqrt( 0.5*(ydata.perr**2 + ydata.nerr**2) )
-            else:
-                print("Warning: No errors on y values. Assuming 5% errors.")
-                yserr = N.abs(yvals*0.05)
-                yserr[yserr < 1e-8] = 1e-8
+        #if yserr is None:
+        #    if ydata.perr is not None and ydata.nerr is not None:
+        #        print("Warning: Symmeterising positive and negative errors")
+        #        yserr = N.sqrt( 0.5*(ydata.perr**2 + ydata.nerr**2) )
+        #    else:
+        #        print("Warning: No errors on y values. Assuming 5% errors.")
+        #        yserr = N.abs(yvals*0.05)
+        #        yserr[yserr < 1e-8] = 1e-8
+        ##SUGGESTION - currently adding a value to an error column populates it with zeroes, resulting in a failure to fit 
+        #elif N.sum(yserr==0.) > 0:
+        #    averr = N.sum(N.abs(yserr[yserr!=0.]))/N.sum(N.abs(yvals[yserr!=0.]))
+        #    print("Warning: Missing errors for some y values, replacing with average relative %g % errors." % averr*100)
+        #    yserr[yserr==0.] = N.abs(yvals[yserr==0.]*averr)
+        ##
+        
+        #SUGGESTION - avoid truncation & floating point overflow, relative errors are what are important for the fitting
+        #minyserr=N.abs(N.min(yserr))
+        #if minyserr<=1e-6:
+        #   print("Warning: Excessively small errors of %g, scaling by %g." % (minyserr,1e-6/minyserr))
+        #   yserr*=1e-6/minyserr
+
+        #SUGGESTION - option to not weight by Y value
+        if not s.weightYsquared:
+            print("No 1/Y2 errors used.")
+            yserr = yvals * 0.
+        else:
+            print("1/Y2 weights of fitted curve used")
+            yserr = yvals * 0. + 1.
 
         # allow exclusion of data from fitting where 'do not process' flag is set 
         usepoint = ydata.flagDontProcessUnset() & xdata.flagDontProcessUnset()
@@ -355,7 +461,7 @@ class Fit(FunctionPlotter):
             return
 
         if minuit is not None:
-            vals, chi2, dof = minuitFit(
+            vals, chi2, dof, errs = minuitFit(
                 evalfunc, params, paramnames, s.values,
                 xvals, yvals, yserr)
         else:
@@ -363,14 +469,20 @@ class Fit(FunctionPlotter):
             retn, chi2, dof = utils.fitLM(
                 evalfunc, params, xvals, yvals, yserr)
             vals = {}
+            errs = {}
+            #SUGGESTION - keep the limits format in case iminuit is used in the future            
             for i, v in zip(paramnames, retn):
-                vals[i] = float(v)
+                name="%s[%g,%g]" % (i,*limits)
+                vals[name] = float(v)
+                errs[name] = -1.
 
-        # list of operations do we can undo the changes
+        # list of operations so we can undo the changes
         operations = []
 
         # populate the return parameters
         operations.append( document.OperationSettingSet(s.get('values'), vals) )
+        #SUGGESTION - record the errors
+        operations.append( document.OperationSettingSet(s.get('errors'), errs) )
 
         # populate the read-only fit quality params
         operations.append( document.OperationSettingSet(s.get('chi2'), float(chi2)) )
@@ -399,7 +511,9 @@ class Fit(FunctionPlotter):
         returns the expression
         """
 
-        paramvals = dict(vals)
+        #SUGGESTION - separate parameters and limits
+        paramvals,limits = valsExtractNamesLimits(vals)
+        
         s = self.settings
 
         # also substitute in data name for variable
